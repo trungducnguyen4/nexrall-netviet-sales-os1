@@ -1,0 +1,502 @@
+import { json, match, need, uid, now, DAY, TZ_OFFSET, readBody, scope, isLead, audit, notify, num, str, todayKey, monthKey, periodParam, startOfDay, wsBucket, wsScope, sameWorkspaceUser, inSameWorkspace, resolveAssignableOwner, LEAD_ROLES } from '../lib/util.js';
+import { computeKpi, saveKpi, getConfig, slaLimit } from '../lib/kpi.js';
+import { STAGES } from './deals.js';
+import { vCount, vText, vFutureTs, vPeriod } from '../lib/validate.js';
+
+/** Ai được xem lịch sử báo cáo của ai — theo cấp bậc: Admin/BGĐ thấy tất cả, TPKD thấy TPKD +
+ * Sales (không thấy Admin), HCNS thấy HCNS + Sales. Sales KHÔNG nằm trong bảng này — sales chỉ
+ * được xem báo cáo của chính mình, xử lý riêng (không phải theo role) ở nơi dùng, không cho xem
+ * báo cáo của sales khác. Mọi role thuộc LEAD_ROLES PHẢI có mặt ở đây — thiếu 1 role thì
+ * `visibleRoles` rỗng khiến `role IN ()` vỡ SQL ở canViewReports()/route bên dưới. */
+const REPORT_VISIBLE_ROLES = {
+  admin: ['admin', 'manager', 'hr', 'sales'],
+  manager: ['manager', 'sales'],
+  hr: ['hr', 'sales'],
+};
+
+/**
+ * Số liệu báo cáo tự tổng hợp cho một khoảng thời gian.
+ *
+ * Đây là phần "tự động làm báo cáo ngày / tuần / tháng" — trước đây chỉ có số của HÔM NAY và báo
+ * cáo tuần đem đúng số hôm nay đi nộp (sai). Nay mọi kỳ đều đếm lại từ dữ liệu gốc: hoạt động đã
+ * ghi, khách thêm mới, deal chuyển giai đoạn, doanh thu ký, báo giá gửi đi.
+ *
+ * `customer_touches` = số lần tương tác có gắn khách hàng — chính là "cập nhật mới: tương tác với
+ * khách hàng" trong yêu cầu bổ sung; tách khỏi `activities` (gồm cả việc nội bộ không gắn khách).
+ */
+async function aggregateReport(env, userId, from, to) {
+  const D = env.DB;
+  const [act, dc, moved, won, quotes] = await Promise.all([
+    D.prepare(`SELECT COUNT(*) n,
+        SUM(CASE WHEN type='call' THEN 1 ELSE 0 END) c,
+        SUM(CASE WHEN type IN ('meeting','demo') THEN 1 ELSE 0 END) m,
+        SUM(CASE WHEN customer_id IS NOT NULL THEN 1 ELSE 0 END) tch
+      FROM nv_activities WHERE user_id=? AND happened_at>=? AND happened_at<?`).bind(userId, from, to).first(),
+    D.prepare('SELECT COUNT(*) n FROM nv_daily_contacts WHERE user_id=? AND created_at>=? AND created_at<?').bind(userId, from, to).first(),
+    D.prepare('SELECT COUNT(*) n FROM nv_deals WHERE owner_id=? AND stage_changed_at>=? AND stage_changed_at<?').bind(userId, from, to).first(),
+    D.prepare("SELECT COUNT(*) n, COALESCE(SUM(value),0) v FROM nv_deals WHERE owner_id=? AND status='won' AND won_at>=? AND won_at<?").bind(userId, from, to).first(),
+    D.prepare('SELECT COUNT(*) n, COALESCE(SUM(total),0) v FROM nv_quotes WHERE owner_id=? AND created_at>=? AND created_at<?').bind(userId, from, to).first(),
+  ]);
+  return {
+    calls: Number(act?.c) || 0,
+    meetings: Number(act?.m) || 0,
+    new_contacts: Number(dc?.n) || 0,
+    deals_moved: Number(moved?.n) || 0,
+    revenue: Number(won?.v) || 0,
+    won_deals: Number(won?.n) || 0,
+    activities: Number(act?.n) || 0,
+    customer_touches: Number(act?.tch) || 0,
+    quotes_sent: Number(quotes?.n) || 0,
+    quotes_value: Number(quotes?.v) || 0,
+  };
+}
+
+/** Mốc 00:00 thứ Hai (giờ VN) của tuần chứa `ts`. getUTCDay() trên mốc đã cộng TZ_OFFSET chính là
+ * thứ trong tuần theo giờ VN; đổi Chủ nhật (0) thành 6 để tuần bắt đầu từ thứ Hai. */
+function startOfWeek(ts = now()) {
+  const sod = startOfDay(ts);
+  const dow = new Date((sod + TZ_OFFSET) * 1000).getUTCDay();
+  return sod - ((dow + 6) % 7) * DAY;
+}
+
+/** Mốc 00:00 ngày 1 (giờ VN) của tháng chứa `ts`. */
+function startOfMonth(ts = now()) {
+  const d = new Date((startOfDay(ts) + TZ_OFFSET) * 1000);
+  return Math.floor(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1) / 1000) - TZ_OFFSET;
+}
+
+/** Nhãn kỳ tuần dạng YYYY-Www tính theo thứ Hai đầu tuần — khớp vPeriod() và cách client hiển thị. */
+function weekKey(ts = now()) {
+  const monday = startOfWeek(ts);
+  const d = new Date((monday + TZ_OFFSET) * 1000);
+  const jan1 = Date.UTC(d.getUTCFullYear(), 0, 1) / 1000 - TZ_OFFSET;
+  const w = Math.floor((monday - startOfWeek(jan1)) / (7 * DAY)) + 1;
+  return d.getUTCFullYear() + '-W' + String(w).padStart(2, '0');
+}
+
+/** Khoảng thời gian [from, to) của một loại báo cáo. */
+function reportRange(kind) {
+  const t = now();
+  if (kind === 'week') return { from: startOfWeek(t), to: t + 1, period: weekKey(t) };
+  if (kind === 'month') return { from: startOfMonth(t), to: t + 1, period: monthKey(t) };
+  return { from: startOfDay(t), to: t + 1, period: todayKey() };
+}
+
+/** true nếu `me` được phép xem lịch sử báo cáo của `target` (cùng workspace + đúng luật cấp bậc). */
+function canViewReports(me, target) {
+  if (!target || wsBucket(target) !== wsBucket(me)) return false;
+  if (me.role === 'sales') return target.id === me.id;
+  return (REPORT_VISIBLE_ROLES[me.role] || []).includes(target.role);
+}
+
+export async function workRoutes(ctx) {
+  const { env, url } = ctx;
+  let p;
+
+  /* ================= Task / Giao việc ================= */
+  if ((p = match(ctx, 'GET', '/api/tasks'))) {
+    need(ctx);
+    const s = scope(ctx, 't.user_id');
+    const { results } = await env.DB.prepare(`SELECT t.*, u.name user_name, a.name assigner_name, d.title deal_title
+      FROM nv_tasks t LEFT JOIN nv_users u ON u.id=t.user_id LEFT JOIN nv_users a ON a.id=t.assigner_id LEFT JOIN nv_deals d ON d.id=t.deal_id
+      WHERE 1=1${s.sql} ORDER BY CASE t.status WHEN 'done' THEN 2 ELSE 1 END, CASE t.priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, t.due_at`).bind(...s.args).all();
+    const t = now();
+    const items = (results || []).map(x => ({
+      ...x,
+      overdue: x.status !== 'done' && x.due_at && x.due_at < t,
+      acceptOverdue: !!x.assigner_id && !x.accepted_at && x.status !== 'done' && (t - x.created_at) > (x.accept_sla_min || 120) * 60,
+    }));
+    return json({ items });
+  }
+
+  if ((p = match(ctx, 'POST', '/api/tasks'))) {
+    need(ctx);
+    const b = await readBody(ctx.request);
+    const taskTitle = vText(b.title, 'Tên công việc', { max: 160, required: true, min: 2 });
+    // Chỉ gán được cho nhân sự CÙNG workspace (demo/chính thức) — id khác workspace/không active
+    // coi như không gán, rơi về chính người tạo (fail-safe, không tin id client gửi lên).
+    const assignee = await resolveAssignableOwner(env, ctx, b.userId);
+    const assignTo = assignee ? assignee.id : ctx.me.id;
+    const isAssignment = assignTo !== ctx.me.id;
+    const cfg = await getConfig(env, assignTo);
+    const t = now(), id = uid('tk');
+    // vCount trả 0 cho cả "không nhập" lẫn "nhập 0" — dùng `!= null` để phân biệt "0 phút" (nhận
+    // ngay) khỏi "không nhập" (dùng SLA mặc định), tránh `|| default` âm thầm ghi đè giá trị 0 hợp lệ.
+    const acceptSla = b.acceptSlaMin != null ? vCount(b.acceptSlaMin, 'SLA nhận việc', { max: 10080 }) : (cfg.task_accept_sla_min || 120);
+    await env.DB.prepare('INSERT INTO nv_tasks (id,user_id,assigner_id,title,detail,type,priority,status,deal_id,customer_id,due_at,accept_sla_min,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .bind(id, assignTo, isAssignment ? ctx.me.id : null, taskTitle, str(b.detail, 800), isAssignment ? 'assignment' : 'task',
+        ['high', 'medium', 'low'].includes(b.priority) ? b.priority : 'medium', 'todo', str(b.dealId, 40), str(b.customerId, 40),
+        vFutureTs(b.dueAt, t + DAY, 'Hạn xử lý'), acceptSla, t).run();
+    if (isAssignment) {
+      await notify(env, assignTo, { type: 'assignment', title: '📌 Bạn được giao việc mới', body: taskTitle, link: '#/tasks', level: 'warn' });
+      await audit(env, ctx.me.id, 'assign_task', 'task', id, { to: assignTo });
+    }
+    return json({ id });
+  }
+
+  if ((p = match(ctx, 'PATCH', '/api/tasks/:id'))) {
+    need(ctx);
+    // scope() vừa giới hạn sales chỉ sửa việc của chính mình, vừa giới hạn TP/Admin trong đúng
+    // workspace (demo/chính thức) — không sửa/khoá được việc của nhân sự workspace khác.
+    const s = scope(ctx, 'user_id');
+    const task = await env.DB.prepare('SELECT * FROM nv_tasks WHERE id=?' + s.sql).bind(p.id, ...s.args).first();
+    if (!task) return json({ error: 'Không tìm thấy công việc' }, 404);
+    const b = await readBody(ctx.request);
+    const t = now();
+    const status = ['todo', 'in_progress', 'done'].includes(b.status) ? b.status : task.status;
+    const accepted = b.accept ? (task.accepted_at || t) : task.accepted_at;
+    await env.DB.prepare('UPDATE nv_tasks SET status=?,accepted_at=?,done_at=?,detail=?,priority=?,due_at=? WHERE id=?')
+      .bind(status, accepted, status === 'done' ? (task.done_at || t) : null,
+        b.detail != null ? str(b.detail, 800) : task.detail,
+        ['high', 'medium', 'low'].includes(b.priority) ? b.priority : task.priority,
+        b.dueAt != null ? num(b.dueAt, task.due_at) : task.due_at, p.id).run();
+    if (status === 'done' && task.assigner_id) {
+      await notify(env, task.assigner_id, { type: 'assignment', title: '✅ Việc đã hoàn thành', body: task.title, link: '#/console', level: 'info' });
+    }
+    return json({ ok: true });
+  }
+
+  /** Xoá việc — người nhận xoá được việc tự tạo; việc do cấp trên giao chỉ cấp trên mới xoá. */
+  if ((p = match(ctx, 'DELETE', '/api/tasks/:id'))) {
+    need(ctx);
+    const s = scope(ctx, 'user_id');
+    const task = await env.DB.prepare('SELECT * FROM nv_tasks WHERE id=?' + s.sql).bind(p.id, ...s.args).first();
+    if (!task) return json({ error: 'Không tìm thấy công việc' }, 404);
+    if (task.assigner_id && !isLead(ctx.me)) return json({ error: 'Việc do cấp trên giao — bạn không thể xoá. Hãy nêu lý do hoàn trả.' }, 403);
+    await env.DB.prepare('DELETE FROM nv_tasks WHERE id=?').bind(p.id).run();
+    await audit(env, ctx.me.id, 'delete', 'task', p.id, { title: task.title });
+    return json({ ok: true });
+  }
+
+  /* ================= Báo cáo EOD / tuần ================= */
+  if ((p = match(ctx, 'GET', '/api/reports'))) {
+    need(ctx);
+    const REPORT_PAGE_SIZE = 10;
+
+    // Phân trang lịch sử báo cáo của MỘT thành viên (dùng khi bấm trang kế trong 1 section) —
+    // vẫn phải qua đúng luật hiển thị theo cấp bậc, không tin userId client gửi lên.
+    if (url.searchParams.get('userId')) {
+      const targetId = url.searchParams.get('userId');
+      const target = await env.DB.prepare('SELECT id,role,is_demo FROM nv_users WHERE id=?').bind(targetId).first();
+      if (!canViewReports(ctx.me, target)) {
+        return json({ error: 'Không có quyền xem báo cáo của nhân sự này' }, 403);
+      }
+      const page = Math.max(1, num(url.searchParams.get('page'), 1));
+      const total = Number(await env.DB.prepare('SELECT COUNT(*) n FROM nv_daily_reports WHERE user_id=?').bind(targetId).first('n')) || 0;
+      const { results: items } = await env.DB.prepare(
+        'SELECT * FROM nv_daily_reports WHERE user_id=? ORDER BY period DESC, submitted_at DESC LIMIT ? OFFSET ?')
+        .bind(targetId, REPORT_PAGE_SIZE, (page - 1) * REPORT_PAGE_SIZE).all();
+      return json({ userId: targetId, items: items || [], total, page, pageSize: REPORT_PAGE_SIZE });
+    }
+
+    // Số liệu tự tổng hợp cho CẢ BA kỳ (của chính người xem) — ngày, tuần đang chạy, tháng đang
+    // chạy. Trước đây chỉ có số của hôm nay nên báo cáo tuần đem số hôm nay đi nộp.
+    const dayR = reportRange('day'), weekR = reportRange('week'), monthR = reportRange('month');
+    const [dayAgg, weekAgg, monthAgg] = await Promise.all([
+      aggregateReport(env, ctx.me.id, dayR.from, dayR.to),
+      aggregateReport(env, ctx.me.id, weekR.from, weekR.to),
+      aggregateReport(env, ctx.me.id, monthR.from, monthR.to),
+    ]);
+    const today = todayKey();
+    const cfg = await getConfig(env, ctx.me.id);
+    const submittedToday = !!(await env.DB.prepare("SELECT id FROM nv_daily_reports WHERE user_id=? AND kind='day' AND period=?").bind(ctx.me.id, today).first());
+    const submittedWeek = !!(await env.DB.prepare("SELECT id FROM nv_daily_reports WHERE user_id=? AND kind='week' AND period=?").bind(ctx.me.id, weekR.period).first());
+    const submittedMonth = !!(await env.DB.prepare("SELECT id FROM nv_daily_reports WHERE user_id=? AND kind='month' AND period=?").bind(ctx.me.id, monthR.period).first());
+
+    // Biểu đồ tương tác 7 ngày gần nhất — để báo cáo tuần nhìn ra nhịp làm việc chứ không chỉ là
+    // một cục tổng. Đếm nhẹ bằng 1 truy vấn gom nhóm theo ngày thay vì 7 lần gọi aggregateReport.
+    const { results: trendRows } = await env.DB.prepare(
+      `SELECT CAST((happened_at + ?) / 86400 AS INTEGER) d,
+              COUNT(*) n,
+              SUM(CASE WHEN customer_id IS NOT NULL THEN 1 ELSE 0 END) tch
+       FROM nv_activities WHERE user_id=? AND happened_at>=? GROUP BY d ORDER BY d`)
+      .bind(TZ_OFFSET, ctx.me.id, startOfDay() - 6 * DAY).all();
+    const trendMap = new Map((trendRows || []).map(r => [Number(r.d), r]));
+    const trend = [];
+    for (let i = 6; i >= 0; i--) {
+      const sod = startOfDay() - i * DAY;
+      const key = Math.floor((sod + TZ_OFFSET) / 86400);
+      const row = trendMap.get(key);
+      trend.push({ date: new Date((sod + TZ_OFFSET) * 1000).toISOString().slice(0, 10), activities: Number(row?.n) || 0, touches: Number(row?.tch) || 0 });
+    }
+
+    // Danh sách thành viên được xem lịch sử báo cáo — theo cấp bậc: Admin thấy tất cả, TPKD thấy
+    // TPKD + Sales (không thấy Admin), Sales CHỈ thấy chính mình (không thấy sales khác/TPKD/Admin).
+    // Luôn giới hạn đúng workspace (demo/chính thức) của người xem.
+    let members;
+    if (ctx.me.role === 'sales') {
+      members = [{ id: ctx.me.id, name: ctx.me.name, role: ctx.me.role }];
+    } else {
+      const visibleRoles = REPORT_VISIBLE_ROLES[ctx.me.role] || [];
+      const { results } = await env.DB.prepare(
+        `SELECT id,name,role FROM nv_users WHERE active=1 AND is_demo=? AND role IN (${visibleRoles.map(() => '?').join(',')})
+         ORDER BY CASE role WHEN 'admin' THEN 1 WHEN 'manager' THEN 2 ELSE 3 END, name`)
+        .bind(wsBucket(ctx.me), ...visibleRoles).all();
+      members = results || [];
+    }
+
+    const sections = [];
+    for (const m of members || []) {
+      const total = Number(await env.DB.prepare('SELECT COUNT(*) n FROM nv_daily_reports WHERE user_id=?').bind(m.id).first('n')) || 0;
+      const { results: items } = await env.DB.prepare(
+        'SELECT * FROM nv_daily_reports WHERE user_id=? ORDER BY period DESC, submitted_at DESC LIMIT ?').bind(m.id, REPORT_PAGE_SIZE).all();
+      sections.push({ userId: m.id, userName: m.name, role: m.role, items: items || [], total, page: 1, pageSize: REPORT_PAGE_SIZE });
+    }
+
+    return json({
+      draft: { period: today, ...dayAgg },
+      weekDraft: { period: weekR.period, ...weekAgg },
+      monthDraft: { period: monthR.period, ...monthAgg },
+      trend,
+      quota: { contacts_day: cfg.quota_daily_contacts || 8, calls_day: cfg.quota_calls || 25, meetings_day: cfg.quota_meetings || 2 },
+      submittedToday, submittedWeek, submittedMonth,
+      deadlineHour: cfg.report_deadline_hour || 17.5,
+      sections,
+    });
+  }
+
+  if ((p = match(ctx, 'POST', '/api/reports'))) {
+    need(ctx);
+    const b = await readBody(ctx.request);
+    const kind = ['week', 'month'].includes(b.kind) ? b.kind : 'day';
+    // Kỳ và số liệu đều do SERVER quyết định, không nhận từ client nữa: đây là điểm cốt lõi của
+    // "tự động làm báo cáo" — người nộp chỉ bổ sung phần định tính (điểm nhấn, vướng mắc, kế
+    // hoạch), còn phần định lượng luôn khớp dữ liệu gốc và không sửa tay được.
+    const range = reportRange(kind);
+    const period = vPeriod(range.period, todayKey());
+    const agg = await aggregateReport(env, ctx.me.id, range.from, range.to);
+    const cfg = await getConfig(env, ctx.me.id);
+    // Giờ VN dạng thập phân để so được mốc 17h30 (17.5)
+    const d0 = new Date();
+    const hourVN = ((d0.getUTCHours() + 7) % 24) + d0.getUTCMinutes() / 60;
+    const late = kind === 'day' && (period < todayKey() || hourVN >= (cfg.report_deadline_hour || 17.5)) ? 1 : 0;
+    // Đặc tả M6 yêu cầu báo cáo BẤT BIẾN sau khi nộp: mỗi lần nộp/cập nhật cùng kỳ báo cáo tạo 1
+    // BẢN GHI MỚI có dấu thời gian riêng thay vì ghi đè bản cũ — nhờ vậy "Lịch sử báo cáo" luôn
+    // phản ánh đúng số lần đã nộp/cập nhật thay vì đứng yên ở tổng số cũ. computeKpi() (kpi.js) đã
+    // được cập nhật để chỉ tính bản MỚI NHẤT của mỗi ngày khi tính điểm kỷ luật, tránh đếm trùng.
+    const id = uid('rp');
+    await env.DB.prepare('INSERT INTO nv_daily_reports (id,user_id,kind,period,calls,meetings,new_contacts,deals_moved,revenue,highlight,blocker,plan,late,submitted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .bind(id, ctx.me.id, kind, period, agg.calls, agg.meetings,
+        agg.new_contacts, agg.deals_moved, agg.revenue,
+        str(b.highlight, 800), str(b.blocker, 800), str(b.plan, 800), late, now()).run();
+    return json({ id, late, period, kind, ...agg });
+  }
+
+  /* ================= KPI ================= */
+  if ((p = match(ctx, 'GET', '/api/kpi'))) {
+    need(ctx);
+    const period = periodParam(url);
+    const targetId = url.searchParams.get('userId');
+    // Xem KPI/hoa hồng của người khác chỉ khi CÙNG workspace (demo/chính thức) — nếu không, coi
+    // như không tìm thấy (không lộ KPI/note/hoa hồng của nhân sự thật cho tài khoản demo).
+    let user;
+    if (isLead(ctx.me) && targetId) {
+      user = await sameWorkspaceUser(env, ctx, targetId);
+      if (!user) return json({ error: 'Không tìm thấy nhân sự' }, 404);
+    } else {
+      user = await env.DB.prepare('SELECT id,name,role,created_at FROM nv_users WHERE id=?').bind(ctx.me.id).first();
+    }
+    const k = await computeKpi(env, user, period);
+    const saved = await env.DB.prepare('SELECT manager_note FROM nv_kpi_scores WHERE user_id=? AND period=?').bind(user.id, period).first();
+    const { results: comms } = await env.DB.prepare('SELECT c.*, d.title deal_title FROM nv_commissions c LEFT JOIN nv_deals d ON d.id=c.deal_id WHERE c.user_id=? AND c.period=? ORDER BY c.created_at DESC').bind(user.id, period).all();
+    return json({ kpi: k, managerNote: saved?.manager_note || '', commissions: comms || [] });
+  }
+
+  if ((p = match(ctx, 'POST', '/api/kpi'))) {
+    need(ctx, LEAD_ROLES);
+    const b = await readBody(ctx.request);
+    const user = await sameWorkspaceUser(env, ctx, b.userId);
+    if (!user) return json({ error: 'Không tìm thấy nhân sự' }, 404);
+    const k = await computeKpi(env, user, str(b.period, 10) || monthKey());
+    await saveKpi(env, k, str(b.note, 500));
+    await notify(env, user.id, { type: 'kpi', title: 'TP đã chấm KPI kỳ ' + k.period, body: 'Tổng điểm ' + k.total + ' – xếp loại ' + k.grade, link: '#/kpi', level: 'info' });
+    return json({ ok: true, kpi: k });
+  }
+
+  if ((p = match(ctx, 'GET', '/api/leaderboard'))) {
+    need(ctx);
+    const period = periodParam(url);
+    // Bảng xếp hạng chỉ tính trong đúng workspace (demo/chính thức) của người xem — cache key
+    // phải tách theo workspace, nếu không kết quả demo có thể bị trả nhầm cho tài khoản thật.
+    const bucket = wsBucket(ctx.me);
+    const cacheKey = 'lb:' + period + ':' + bucket;
+    try {
+      const hit = await env.SHARED_KV?.get(cacheKey, 'json');
+      if (hit) return json({ items: hit, cached: true });
+    } catch (e) { /* KV optional */ }
+    const { results: users } = await env.DB.prepare("SELECT id,name,role FROM nv_users WHERE role='sales' AND active=1 AND is_demo=?").bind(bucket).all();
+    const items = [];
+    for (const u of users || []) {
+      const k = await computeKpi(env, u, period);
+      items.push({ userId: u.id, name: u.name, total: k.total, grade: k.grade, revenue: k.metrics.revenue, wonN: k.metrics.wonN, newContacts: k.metrics.newContacts });
+    }
+    items.sort((a, b) => b.total - a.total);
+    try { await env.SHARED_KV?.put(cacheKey, JSON.stringify(items), { expirationTtl: 60 }); } catch (e) { /* noop */ }
+    return json({ items });
+  }
+
+  if ((p = match(ctx, 'GET', '/api/commissions'))) {
+    need(ctx);
+    const s = scope(ctx, 'c.user_id');
+    const { results } = await env.DB.prepare(`SELECT c.*, d.title deal_title, u.name user_name, pt.name partner_name FROM nv_commissions c
+      LEFT JOIN nv_deals d ON d.id=c.deal_id LEFT JOIN nv_users u ON u.id=c.user_id
+      LEFT JOIN nv_partners pt ON pt.id=c.partner_id WHERE 1=1${s.sql} ORDER BY c.created_at DESC LIMIT 100`).bind(...s.args).all();
+    return json({ items: results || [] });
+  }
+
+  /**
+   * Đổi trạng thái chi hoa hồng (BL-11: hoa hồng chỉ chốt khi khách thanh toán đủ).
+   * du_kien → da_duyet (đã xác nhận thanh toán) → da_chi (đã trả lương). Chỉ TP/Admin.
+   */
+  if ((p = match(ctx, 'PATCH', '/api/commissions/:id'))) {
+    need(ctx, LEAD_ROLES);
+    const b = await readBody(ctx.request);
+    const st = ['du_kien', 'da_duyet', 'da_chi', 'huy'].includes(b.status) ? b.status : null;
+    if (!st) return json({ error: 'Trạng thái hoa hồng không hợp lệ' }, 400);
+    const c = await env.DB.prepare('SELECT * FROM nv_commissions WHERE id=?').bind(p.id).first();
+    if (!c || !(await inSameWorkspace(env, ctx, c.user_id))) return json({ error: 'Không tìm thấy bản ghi hoa hồng' }, 404);
+    if (c.status === 'da_chi' && st !== 'da_chi') return json({ error: 'Hoa hồng đã chi không thể đổi trạng thái.' }, 409);
+    if (st === 'da_duyet' || st === 'da_chi') {
+      const d = await env.DB.prepare('SELECT status FROM nv_deals WHERE id=?').bind(c.deal_id).first();
+      if (d?.status !== 'won') return json({ error: 'Chỉ duyệt/chi hoa hồng cho deal đã chốt.' }, 409);
+    }
+    await env.DB.prepare('UPDATE nv_commissions SET status=? WHERE id=?').bind(st, p.id).run();
+    await audit(env, ctx.me.id, 'commission_status', 'commission', p.id, { from: c.status, to: st, amount: c.amount });
+    if (st === 'da_chi') await notify(env, c.user_id, { type: 'kpi', title: '💰 Hoa hồng đã được chi', body: 'Số tiền ' + new Intl.NumberFormat('vi-VN').format(c.amount) + ' đ', link: '#/kpi', level: 'info' });
+    return json({ ok: true });
+  }
+
+  /* ================= PIP ================= */
+  if ((p = match(ctx, 'GET', '/api/pip'))) {
+    need(ctx);
+    const s = scope(ctx, 'p.user_id');
+    const { results } = await env.DB.prepare(`SELECT p.*, u.name user_name, m.name manager_name FROM nv_pip_records p
+      LEFT JOIN nv_users u ON u.id=p.user_id LEFT JOIN nv_users m ON m.id=p.manager_id WHERE 1=1${s.sql} ORDER BY p.created_at DESC`).bind(...s.args).all();
+    return json({ items: results || [] });
+  }
+  if ((p = match(ctx, 'POST', '/api/pip'))) {
+    need(ctx, LEAD_ROLES);
+    const b = await readBody(ctx.request);
+    if (!b.goal) return json({ error: 'Thiếu mục tiêu' }, 400);
+    const target = await sameWorkspaceUser(env, ctx, b.userId);
+    if (!target) return json({ error: 'Không tìm thấy nhân sự' }, 404);
+    const phase = ['30', '60', '90'].includes(String(b.phase)) ? String(b.phase) : '30';
+    const t = now(), id = uid('pip');
+    await env.DB.prepare('INSERT INTO nv_pip_records (id,user_id,manager_id,phase,goal,metric,start_at,end_at,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
+      .bind(id, target.id, ctx.me.id, phase, str(b.goal, 600), str(b.metric, 300), t, t + Number(phase) * DAY, 'dang_chay', t).run();
+    await notify(env, target.id, { type: 'pip', title: 'Bạn được đưa vào chương trình cải thiện ' + phase + ' ngày', body: str(b.goal, 120), link: '#/kpi', level: 'danger' });
+    return json({ id });
+  }
+  if ((p = match(ctx, 'PATCH', '/api/pip/:id'))) {
+    need(ctx, LEAD_ROLES);
+    const pip = await env.DB.prepare('SELECT user_id FROM nv_pip_records WHERE id=?').bind(p.id).first();
+    if (!pip || !(await inSameWorkspace(env, ctx, pip.user_id))) return json({ error: 'Không tìm thấy bản ghi PIP' }, 404);
+    const b = await readBody(ctx.request);
+    const st = ['dang_chay', 'dat', 'khong_dat', 'huy'].includes(b.status) ? b.status : 'dang_chay';
+    await env.DB.prepare('UPDATE nv_pip_records SET status=?, result_note=? WHERE id=?').bind(st, str(b.note, 500), p.id).run();
+    return json({ ok: true });
+  }
+
+  /* ================= Console Trưởng phòng ================= */
+  if ((p = match(ctx, 'GET', '/api/team'))) {
+    need(ctx, LEAD_ROLES);
+    const period = periodParam(url);
+    const t = now();
+    // Đội nhóm chỉ gồm sales CÙNG workspace (demo/chính thức) với TP/Admin đang xem — tránh
+    // Console đội của tài khoản thật bị trộn số liệu mẫu demo, và ngược lại.
+    const bucket = wsBucket(ctx.me);
+    const { results: users } = await env.DB.prepare("SELECT id,name,role,title FROM nv_users WHERE role='sales' AND active=1 AND is_demo=? ORDER BY name").bind(bucket).all();
+    // Phạm vi nhân sự HIỂN THỊ ở thẻ "Tổng quan đội" có thể rộng hơn đội sales (xem dưới) —
+    // nhưng các cảnh báo/định mức liên hệ mới/báo cáo trễ ở dưới CHỈ áp dụng cho sales
+    // (Trưởng phòng/Admin không có định mức liên hệ, dùng `users` như cũ cho các đoạn đó).
+    let monitorUsers = users;
+    if (ctx.me.role === 'admin' && ctx.me.can_manage_accounts) {
+      // TGĐ (Admin toàn quyền quản lý tài khoản): giám sát TOÀN BỘ nhân sự — sales, Trưởng
+      // phòng và các Admin khác — không chỉ đội sales.
+      const r = await env.DB.prepare("SELECT id,name,role,title FROM nv_users WHERE active=1 AND is_demo=? AND id!=? ORDER BY CASE role WHEN 'manager' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, name").bind(bucket, ctx.me.id).all();
+      monitorUsers = r.results || [];
+    } else if (ctx.me.role === 'admin') {
+      // Admin nghiệp vụ (không toàn quyền, vd HUONGNT/DUCHT): đội sales như cũ + các Trưởng
+      // phòng, để theo dõi thêm hoạt động của cấp quản lý (vd DUCNH).
+      const r = await env.DB.prepare("SELECT id,name,role,title FROM nv_users WHERE active=1 AND is_demo=? AND role IN ('sales','manager') ORDER BY CASE role WHEN 'manager' THEN 0 ELSE 1 END, name").bind(bucket).all();
+      monitorUsers = r.results || [];
+    }
+    const cfg = await getConfig(env);
+    const wsDeals = wsScope(ctx, 'd.owner_id');
+    const { results: deals } = await env.DB.prepare(`SELECT d.*, c.name customer_name, u.name owner_name FROM nv_deals d LEFT JOIN nv_customers c ON c.id=d.customer_id LEFT JOIN nv_users u ON u.id=d.owner_id WHERE 1=1${wsDeals.sql}`).bind(...wsDeals.args).all();
+    const members = [];
+    for (const u of monitorUsers || []) {
+      const k = await computeKpi(env, u, period);
+      const mine = (deals || []).filter(d => d.owner_id === u.id);
+      const overdue = mine.filter(d => d.status === 'open' && (t - (d.last_activity_at || 0)) > (slaLimit(cfg, d.stage) * DAY));
+      members.push({
+        ...u, kpi: { total: k.total, grade: k.grade, performance: k.performance, discipline: k.discipline, proactive: k.proactive },
+        metrics: k.metrics, overdueDeals: overdue.length,
+        pipeline: mine.filter(d => d.status === 'open').reduce((s, d) => s + d.value * d.probability / 100, 0),
+      });
+    }
+    const funnel = STAGES.map(st => {
+      const arr = (deals || []).filter(d => d.stage === st);
+      return { stage: st, count: arr.length, value: arr.reduce((s, d) => s + (d.value || 0), 0) };
+    });
+    const alerts = [];
+    (deals || []).forEach(d => {
+      if (d.status === 'open' && (t - (d.last_activity_at || 0)) > (slaLimit(cfg, d.stage) * DAY)) {
+        alerts.push({ level: 'danger', type: 'sla', text: `Deal "${d.title}" (${d.owner_name}) đã ${Math.floor((t - d.last_activity_at) / DAY)} ngày không hoạt động.`, link: '#/pipeline' });
+      }
+    });
+    const wsQuotes = wsScope(ctx, 'q.owner_id');
+    // Trả cả 2 vòng (V1: TPKD, V2: Giám đốc) — front-end tự lọc theo vai trò người xem để hiện
+    // đúng nút duyệt của vòng họ được phép.
+    const { results: pendingQuotes } = await env.DB.prepare(`SELECT q.*, u.name owner_name, c.name customer_name FROM nv_quotes q LEFT JOIN nv_users u ON u.id=q.owner_id LEFT JOIN nv_customers c ON c.id=q.customer_id WHERE q.status IN ('pending_v1','pending_v2')${wsQuotes.sql} ORDER BY q.created_at DESC`).bind(...wsQuotes.args).all();
+    (pendingQuotes || []).forEach(q => alerts.push({ level: 'warn', type: 'approval', text: `Báo giá "${q.title}" chiết khấu ${q.discount_pct}% chờ duyệt ${q.status === 'pending_v1' ? 'V1 (TPKD)' : 'V2 (Giám đốc)'} (${q.owner_name}).`, link: '#/saleskit' }));
+    const wsContracts = wsScope(ctx, 'c.owner_id');
+    const { results: pendingContracts } = await env.DB.prepare(`SELECT c.*, u.name owner_name FROM nv_contracts c LEFT JOIN nv_users u ON u.id=c.owner_id WHERE c.status IN ('pending_v1','pending_v2')${wsContracts.sql} ORDER BY c.created_at DESC`).bind(...wsContracts.args).all();
+    (pendingContracts || []).forEach(c => alerts.push({ level: 'warn', type: 'approval', text: `Hợp đồng "${c.title}" chờ duyệt ${c.status === 'pending_v1' ? 'V1 (TPKD)' : 'V2 (HCNS)'} (${c.owner_name}).`, link: '#/saleskit' }));
+    const wsTasks = wsScope(ctx, 't.user_id');
+    const { results: lateTasks } = await env.DB.prepare(`SELECT t.*, u.name user_name FROM nv_tasks t LEFT JOIN nv_users u ON u.id=t.user_id WHERE t.status!='done' AND t.assigner_id IS NOT NULL AND t.accepted_at IS NULL${wsTasks.sql}`).bind(...wsTasks.args).all();
+    (lateTasks || []).forEach(x => {
+      if ((t - x.created_at) > (x.accept_sla_min || 120) * 60) alerts.push({ level: 'danger', type: 'assignment', text: `${x.user_name} chưa nhận việc "${x.title}" quá SLA — cần leo thang.`, link: '#/tasks' });
+    });
+    /* --- Cảnh báo PIP tự động (FR-M8-3): < ngưỡng% định mức liên hệ mới trong N ngày --- */
+    const pipRatio = Number(cfg.pip_quota_ratio ?? 0.7);
+    const pipWindow = Number(cfg.pip_window_days ?? 14);
+    const winFrom = t - pipWindow * DAY;
+    const wsPips = wsScope(ctx, 'user_id');
+    const { results: openPips } = await env.DB.prepare(`SELECT user_id FROM nv_pip_records WHERE status='dang_chay'${wsPips.sql}`).bind(...wsPips.args).all();
+    const onPip = new Set((openPips || []).map(x => x.user_id));
+    for (const u of users || []) {
+      if (onPip.has(u.id)) continue; // đang trong PIP rồi thì không cảnh báo lại
+      const ucfg = await getConfig(env, u.id);
+      const perDay = Number(ucfg.quota_daily_contacts || 8);
+      const workdaysInWindow = Math.max(1, Math.round(pipWindow * 5 / 7));
+      const expected = perDay * workdaysInWindow;
+      const got = Number(await env.DB.prepare('SELECT COUNT(*) n FROM nv_daily_contacts WHERE user_id=? AND created_at>=?')
+        .bind(u.id, winFrom).first('n')) || 0;
+      const pct = expected ? got / expected : 1;
+      if (pct < pipRatio) {
+        alerts.push({
+          level: 'danger', type: 'pip',
+          text: `${u.name} chỉ đạt ${Math.round(pct * 100)}% định mức liên hệ mới trong ${pipWindow} ngày (${got}/${expected}) — dưới ngưỡng ${Math.round(pipRatio * 100)}%, cần kích hoạt PIP.`,
+          link: '#/console', userId: u.id,
+        });
+      }
+    }
+
+    const missing = [];
+    for (const u of users || []) {
+      const r = await env.DB.prepare("SELECT id FROM nv_daily_reports WHERE user_id=? AND kind='day' AND period=?").bind(u.id, todayKey(-1)).first();
+      if (!r) missing.push(u.name);
+    }
+    if (missing.length) alerts.push({ level: 'warn', type: 'report', text: 'Chưa nộp báo cáo hôm qua: ' + missing.join(', '), link: '#/reports' });
+
+    const totals = {
+      pipeline: (deals || []).filter(d => d.status === 'open').reduce((s, d) => s + d.value * d.probability / 100, 0),
+      won: (deals || []).filter(d => d.status === 'won').reduce((s, d) => s + d.value, 0),
+      openCount: (deals || []).filter(d => d.status === 'open').length,
+    };
+    return json({ period, members, funnel, alerts, totals, pendingQuotes: pendingQuotes || [], pendingContracts: pendingContracts || [] });
+  }
+
+  return null;
+}
