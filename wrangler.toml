@@ -1,7 +1,7 @@
 # Cấu hình dùng cho CẢ local (`npm run dev`) LẪN deploy production qua Cloudflare
 # Worker thật: nextrall-netviet-sales-os1
 
-name = "nextrall-netviet-sales-os1"
+name = "nexrall-netviet-sales-os1"
 main = "local/entry.js"
 compatibility_date = "2026-09-01"
 
