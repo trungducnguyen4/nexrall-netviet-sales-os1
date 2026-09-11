@@ -1,5 +1,7 @@
 # Cấu hình dùng cho CẢ local (`npm run dev`) LẪN deploy production qua Cloudflare
-# Worker thật: nextrall-netviet-sales-os1
+# Worker thật: nexrall-netviet-sales-os1
+# Mọi ID dưới đây thuộc account Trungductwice@gmail.com (30714345f6e1dcdd6326cfe203ee379e)
+# — đúng account mà Workers Builds đang deploy. ID của account khác sẽ báo "not found".
 
 name = "nexrall-netviet-sales-os1"
 main = "local/entry.js"
@@ -20,13 +22,13 @@ not_found_handling = "single-page-application"
 [[d1_databases]]
 binding = "DB"
 database_name = "netviet-sales-os"
-database_id = "79b5d7cc-4121-499e-bab0-cbbdabc53221"
+database_id = "d66cff24-9f74-4112-9ff7-0dddfc40061f"
 
 
 # Cloudflare KV
 [[kv_namespaces]]
 binding = "SHARED_KV"
-id = "3c09fbd8cbd24f0aa11150366b80892e"
+id = "4259d86abe2d4379be3a6b035c02462e"
 
 
 # Cloudflare R2
