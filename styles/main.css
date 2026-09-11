@@ -25,6 +25,13 @@ img{max-width:100%}
 .topbar{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:10px;padding:10px 14px;
   background:var(--bg2);border-bottom:1px solid var(--line)}
 .topbar .brand{display:flex;align-items:center;gap:9px;font-weight:800;letter-spacing:.3px}
+/* Đồng hồ ngày/giờ ở thanh trên cùng: ngày trên, giờ chạy theo giây ở dưới. Giờ dùng chữ số đều
+   bề ngang (tabular-nums) để con số không nhảy ngang mỗi giây. */
+.topbar .brand.topbar-clock{flex-direction:column;align-items:flex-start;gap:0;line-height:1.15}
+.topbar-clock .clock-date{font-size:13px;font-weight:800;letter-spacing:.3px}
+.topbar-clock .clock-time{font-size:12px;font-weight:700;color:var(--mut);
+  font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+.topbar-clock .clock-zone{margin-left:5px;font-size:11px;font-weight:600;opacity:.72;letter-spacing:.2px}
 .brand-logo{height:19px;display:block}
 .sidebar a.brand-logo-link{display:inline-block;padding:7px 10px;border-radius:10px;background:#fff;width:auto}
 .sidebar a.brand-logo-link:hover,.sidebar a.brand-logo-link:active,.sidebar a.brand-logo-link.active{background:#fff;box-shadow:none}
@@ -59,8 +66,10 @@ main{flex:1;padding:14px 14px calc(var(--nav-h) + 26px);max-width:1240px;width:1
 .bottom-nav a.active{color:var(--red)}
 
 /* ---------- sidebar (TP/Admin) ---------- */
-.with-side{display:flex;flex-direction:row}
-.sidebar{width:216px;flex:none;background:#0B2342;border-right:1px solid #0B2342;padding:12px 10px;
+/* Bề rộng để trong biến vì nút thu gọn nằm NGOÀI sidebar (sidebar có overflow:auto nên đặt bên
+   trong sẽ bị cắt mất phần thò ra) — nút bám mép phải bằng cách đọc lại đúng biến này. */
+.with-side{display:flex;flex-direction:row;--side-w:216px}
+.sidebar{width:var(--side-w);flex:none;background:#0B2342;border-right:1px solid #0B2342;padding:12px 10px;
   position:sticky;top:0;height:100vh;overflow:auto}
 .sidebar .sec{color:#6B7280;font-size:10.5px;text-transform:uppercase;letter-spacing:.7px;margin:14px 8px 6px}
 .sidebar a{display:flex;align-items:center;gap:9px;padding:9px 10px;border-radius:10px;color:#B8C4D9;font-size:13.5px;font-weight:400}
@@ -73,14 +82,43 @@ main{flex:1;padding:14px 14px calc(var(--nav-h) + 26px);max-width:1240px;width:1
 .side-profile-name{font-size:13px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .side-profile-role{font-size:11px;color:#93A5C0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .side-scrim{position:fixed;inset:0;background:#000a;z-index:45}
+
+/* Nút thò ra ở mép phải sidebar để thu gọn / mở rộng. Nửa chìm trong sidebar, nửa thò ra ngoài. */
+.side-toggle{position:fixed;left:calc(var(--side-w) - 13px);top:50%;transform:translateY(-50%);
+  z-index:46;width:26px;height:52px;padding:0;border:1px solid var(--line);border-left:0;
+  border-radius:0 13px 13px 0;background:var(--bg2);color:var(--mut);
+  display:grid;place-items:center;cursor:pointer;
+  box-shadow:2px 0 10px rgba(15,23,42,.12);transition:left .2s ease,color .18s ease}
+.side-toggle:hover{color:var(--txt)}
+/* Mũi tên quay TRÁI khi menu đang mở (bấm để thu vào), quay PHẢI khi đã thu (bấm để thò ra). */
+.side-toggle svg{transform:rotate(180deg);transition:transform .2s ease}
+.side-collapsed .side-toggle svg{transform:none}
+
 @media(max-width:899px){
-  .sidebar{position:fixed;left:0;top:0;bottom:0;z-index:50;transform:translateX(-100%);transition:.22s}
+  /* Điện thoại: sidebar là ngăn kéo trượt vào, đã có nút hamburger — không dùng nút thu gọn, và
+     luôn giữ đủ bề rộng kể cả khi lựa chọn "thu gọn" từ desktop còn lưu trong localStorage. */
+  .sidebar{position:fixed;left:0;top:0;bottom:0;z-index:50;width:216px;transform:translateX(-100%);transition:.22s}
   .sidebar.open{transform:none}
+  .side-toggle{display:none}
 }
 @media(min-width:900px){
   .side-scrim,.menu-btn{display:none}
   main{padding-bottom:30px}
   .bottom-nav.desktop-hide{display:none}
+  .sidebar{transition:width .2s ease}
+
+  /* Đã thu gọn: còn đúng một dải icon. Nhãn, tiêu đề nhóm, logo và khối tên/chức danh đều ẩn —
+     giữ lại thì chữ bị cắt cụt giữa chừng, xấu hơn là bỏ hẳn. Rê chuột vào icon vẫn ra tên mục
+     nhờ thuộc tính title. */
+  .shell.side-collapsed{--side-w:62px}
+  .side-collapsed .sidebar{padding-left:7px;padding-right:7px;overflow-x:hidden}
+  .side-collapsed .side-brand,
+  .side-collapsed .sidebar .sec,
+  .side-collapsed .side-profile-info,
+  .side-collapsed .side-label{display:none}
+  .side-collapsed .sidebar a{justify-content:center;gap:0;padding:10px 0}
+  .side-collapsed .sidebar .side-profile-btn{justify-content:center;padding:9px 0;margin-bottom:6px}
+  .side-collapsed .sidebar .side-profile-btn .avatar{margin:0}
 }
 
 /* ---------- scroll / hover fx ---------- */
@@ -283,3 +321,19 @@ textarea{min-height:74px;resize:vertical}
 .spark .cl{font-size:9.5px;color:var(--mut);white-space:nowrap}
 .spark .cv{font-size:10.5px;font-weight:700;font-variant-numeric:tabular-nums}
 .spark .col.today .cv{color:var(--orange)}
+
+/* ===== PWA — CHỈ áp dụng khi app đã được cài lên màn hình chính =====
+   Trong trình duyệt (desktop lẫn mobile) không có quy tắc nào dưới đây chạy, nên giao diện
+   web hiện tại giữ nguyên 100%. Khi chạy standalone, app chiếm trọn màn hình iPhone nên
+   phải chừa lề cho thanh trạng thái / Dynamic Island (trên) và thanh Home (dưới).
+   Trên máy không có vùng khuyết, env(...) = 0 → không đổi gì. */
+@media (display-mode:standalone){
+  .topbar{padding-top:calc(10px + env(safe-area-inset-top,0px))}
+  .sidebar{padding-top:calc(12px + env(safe-area-inset-top,0px))}
+  .login-wrap{padding-top:calc(26px + env(safe-area-inset-top,0px));
+    padding-bottom:calc(26px + env(safe-area-inset-bottom,0px))}
+}
+@media (display-mode:standalone) and (max-width:899px){
+  /* thanh điều hướng dưới cao thêm đúng phần safe-area của nó → nội dung phải lùi tương ứng */
+  main{padding-bottom:calc(var(--nav-h) + 26px + env(safe-area-inset-bottom,0px))}
+}
