@@ -1,6 +1,7 @@
 /* Web Push delivery for the Workers runtime.  This deliberately uses Web Crypto
  * instead of a Node-only web-push package, so it runs in Cloudflare Workers. */
-import { now } from './util.js';
+
+const now = () => Math.floor(Date.now() / 1000);
 
 const encoder = new TextEncoder();
 const b64url = (bytes) => btoa(String.fromCharCode(...bytes))
