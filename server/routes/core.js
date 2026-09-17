@@ -5,6 +5,7 @@ import { appMode } from '../lib/db.js';
 import { vPassword, vText, vPhone, vDateStr, vEmail } from '../lib/validate.js';
 import { clientIp, loginRateLimited, recordLoginFailure, clearLoginAttempts } from '../lib/ratelimit.js';
 import { autoSubmitOutstandingReports } from './work.js';
+import { sendPushToUser } from '../lib/push.js';
 
 /** Trần dung lượng ảnh đại diện sau khi client đã thu nhỏ — 320px vuông JPEG chỉ tầm 20-40KB,
  * 512KB là biên rộng rãi cho ảnh PNG/WEBP nhiều chi tiết mà vẫn không làm nặng /api/bootstrap. */
@@ -278,6 +279,14 @@ export async function coreRoutes(ctx) {
       if (sent.has(k)) return false;
       sent.add(k);
       await notify(env, userId, o);
+      // In-app records retain business context. Web Push remains deliberately generic because
+      // it can appear on a locked device screen.
+      await sendPushToUser(env, userId, {
+        title: 'NetViet Sales OS',
+        body: 'Bạn có một thông báo mới cần xử lý.',
+        link: o.link,
+        tag: `salesos-${o.type || 'alert'}`,
+      });
       return true;
     };
 
